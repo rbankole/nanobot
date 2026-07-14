@@ -21,10 +21,10 @@ from nanobot.channels.contracts import (
     channel_field_value,
     channel_instance_specs,
     channel_set_config_enabled,
-    channel_supports_multiple_instances,
     channel_value_present,
     external_channel_enabled,
     refresh_channel_feature_metadata,
+    resolve_channel_action_target,
     stringify_channel_value,
 )
 from nanobot.channels.registry import DEFAULT_ENABLED_CHANNELS
@@ -598,7 +598,11 @@ def enable_optional_feature(
                 f"Channel '{name}' is not importable after enable: {exc}",
                 status=500,
             ) from exc
-        target_instance_id = requested_instance_id or "default"
+        target_instance_id = resolve_channel_action_target(
+            channel_cls,
+            requested_instance_id,
+            allow_global_multi_instance=False,
+        )
         set_channel_config_enabled(
             config_path,
             name,
@@ -609,9 +613,11 @@ def enable_optional_feature(
         message = f"Enabled channel '{name}'"
     elif name in plugin_channels:
         channel_cls = plugin_channels[name]
-        target_instance_id = requested_instance_id
-        if target_instance_id is None and not channel_supports_multiple_instances(channel_cls):
-            target_instance_id = "default"
+        target_instance_id = resolve_channel_action_target(
+            channel_cls,
+            requested_instance_id,
+            allow_global_multi_instance=True,
+        )
         set_channel_config_enabled(
             config_path,
             name,
@@ -683,12 +689,15 @@ def disable_optional_feature(
         channel_cls = load_channel_class(name) if name in builtin_channels else plugin_channels[name]
     except ImportError:
         channel_cls = None
-    target_instance_id = requested_instance_id
-    is_single_instance = (
-        channel_cls is not None and not channel_supports_multiple_instances(channel_cls)
+    target_instance_id = (
+        resolve_channel_action_target(
+            channel_cls,
+            requested_instance_id,
+            allow_global_multi_instance=name not in builtin_channels,
+        )
+        if channel_cls is not None
+        else requested_instance_id or "default"
     )
-    if target_instance_id is None and (name in builtin_channels or is_single_instance):
-        target_instance_id = "default"
     set_channel_config_enabled(
         config_path,
         name,
