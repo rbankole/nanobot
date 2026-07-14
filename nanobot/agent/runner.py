@@ -33,8 +33,10 @@ from nanobot.utils.helpers import (
 from nanobot.utils.llm_runtime import LLMRuntime
 from nanobot.utils.prompt_templates import render_template
 from nanobot.utils.runtime import (
+    CONTEXT_OVERFLOW_FALLBACK_MESSAGE,
     EMPTY_FINAL_RESPONSE_MESSAGE,
     build_budget_exhausted_finalization_message,
+    build_context_overflow_reprompt,
     build_finalization_retry_message,
     build_goal_continue_message,
     build_length_recovery_message,
@@ -55,6 +57,8 @@ _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
+_CONTEXT_OVERFLOW_REPROMPT_MAX_TOKENS = 256
+_CONTEXT_OVERFLOW_REPROMPT_MIN_TOKENS = 32
 
 @dataclass(slots=True)
 class AgentRunSpec:
@@ -97,6 +101,15 @@ class AgentRunResult:
     error: str | None = None
     tool_events: list[dict[str, str]] = field(default_factory=list)
     had_injections: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _ContextOverflow:
+    prompt_tokens: int
+    input_budget: int
+    context_window_tokens: int
+    max_tokens: int
+    estimate_source: str
 
 
 class AgentRunner:
@@ -390,6 +403,35 @@ class AgentRunner:
                 session_key=spec.session_key,
             )
             await hook.before_iteration(context)
+            overflow = self._context_overflow(spec, messages_for_model)
+            if overflow is not None:
+                logger.warning(
+                    "Context budget exceeded for {}: prompt={} hard_budget={} "
+                    "window={} max_tokens={} via {}; requesting a no-tools final response",
+                    spec.session_key or "default",
+                    overflow.prompt_tokens,
+                    overflow.input_budget,
+                    overflow.context_window_tokens,
+                    overflow.max_tokens,
+                    overflow.estimate_source,
+                )
+                final_content = await self._try_context_overflow_reprompt(
+                    spec,
+                    hook,
+                    context,
+                    overflow,
+                    usage,
+                )
+                if final_content is None:
+                    final_content = CONTEXT_OVERFLOW_FALLBACK_MESSAGE
+                stop_reason = "context_overflow"
+                self._append_final_message(messages, final_content)
+                context.final_content = final_content
+                context.stop_reason = stop_reason
+                if hook.wants_streaming():
+                    await hook.on_stream_end(context, resuming=False)
+                await hook.after_iteration(context)
+                break
             response = await self._request_model(spec, messages_for_model, hook, context)
             context.response = response
             context.tool_calls = list(response.tool_calls)
@@ -694,6 +736,7 @@ class AgentRunner:
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None,
+        max_tokens: int | None = None,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "messages": messages,
@@ -704,7 +747,7 @@ class AgentRunner:
         }
         generation = spec.runtime.generation
         kwargs["temperature"] = generation.temperature
-        kwargs["max_tokens"] = generation.max_tokens
+        kwargs["max_tokens"] = generation.max_tokens if max_tokens is None else max_tokens
         kwargs["reasoning_effort"] = generation.reasoning_effort
         return kwargs
 
@@ -984,9 +1027,131 @@ class AgentRunner:
         self,
         spec: AgentRunSpec,
         messages: list[dict[str, Any]],
+        *,
+        max_tokens: int | None = None,
     ) -> LLMResponse:
-        kwargs = self._build_request_kwargs(spec, messages, tools=None)
+        kwargs = self._build_request_kwargs(
+            spec,
+            messages,
+            tools=None,
+            max_tokens=max_tokens,
+        )
         return await spec.runtime.provider.chat_with_retry(**kwargs)
+
+    def _context_overflow(
+        self,
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+    ) -> _ContextOverflow | None:
+        """Return details only when the prepared request exceeds the provider hard limit.
+
+        Context governance may target a smaller soft block or reserve safety headroom. Those
+        limits are useful for compaction but do not prove that a provider request will fail, so
+        this final gate uses only the configured context window and requested response limit.
+        """
+        context_window_tokens = spec.runtime.context_window_tokens
+        if not isinstance(context_window_tokens, int) or context_window_tokens <= 0:
+            return None
+
+        configured_max_tokens = spec.runtime.generation.max_tokens
+        if not isinstance(configured_max_tokens, int):
+            return None
+        max_tokens = max(1, configured_max_tokens)
+        input_budget = max(0, context_window_tokens - max_tokens)
+        try:
+            tools = spec.tools.get_definitions()
+        except Exception:
+            logger.exception("Unable to load tool definitions for context budget preflight")
+            return None
+
+        prompt_tokens, source = estimate_prompt_tokens_chain(
+            spec.runtime.provider,
+            spec.runtime.model,
+            messages,
+            tools,
+        )
+        if prompt_tokens <= 0 or prompt_tokens <= input_budget:
+            return None
+        return _ContextOverflow(
+            prompt_tokens=prompt_tokens,
+            input_budget=input_budget,
+            context_window_tokens=context_window_tokens,
+            max_tokens=max_tokens,
+            estimate_source=str(source or "unknown"),
+        )
+
+    async def _try_context_overflow_reprompt(
+        self,
+        spec: AgentRunSpec,
+        hook: AgentHook,
+        context: AgentHookContext,
+        overflow: _ContextOverflow,
+        usage: dict[str, int],
+    ) -> str | None:
+        """Ask the model for a short failure response without replaying oversized context."""
+        retry_messages = [
+            build_context_overflow_reprompt(
+                prompt_tokens=overflow.prompt_tokens,
+                input_budget=overflow.input_budget,
+                context_window_tokens=overflow.context_window_tokens,
+                max_tokens=overflow.max_tokens,
+            )
+        ]
+        retry_prompt_tokens, source = estimate_prompt_tokens_chain(
+            spec.runtime.provider,
+            spec.runtime.model,
+            retry_messages,
+            None,
+        )
+        available_output = overflow.context_window_tokens - retry_prompt_tokens
+        retry_max_tokens = min(
+            overflow.max_tokens,
+            _CONTEXT_OVERFLOW_REPROMPT_MAX_TOKENS,
+            available_output,
+        )
+        if (
+            retry_prompt_tokens <= 0
+            or retry_max_tokens < _CONTEXT_OVERFLOW_REPROMPT_MIN_TOKENS
+        ):
+            logger.warning(
+                "Context-overflow re-prompt does not fit for {}: prompt={} available_output={} "
+                "via {}; using fallback",
+                spec.session_key or "default",
+                retry_prompt_tokens,
+                available_output,
+                source or "unknown",
+            )
+            return None
+
+        try:
+            response = await self._request_no_tools(
+                spec,
+                retry_messages,
+                max_tokens=retry_max_tokens,
+            )
+        except Exception:
+            logger.exception(
+                "Context-overflow re-prompt failed for {}; using fallback",
+                spec.session_key or "default",
+            )
+            return None
+
+        raw_usage = self._usage_or_estimate(spec, retry_messages, response)
+        self._accumulate_usage(usage, raw_usage)
+        if response.finish_reason == "error" or response.has_tool_calls:
+            logger.warning(
+                "Context-overflow re-prompt returned finish_reason='{}' with {} tool call(s) "
+                "for {}; using fallback",
+                response.finish_reason,
+                len(response.tool_calls),
+                spec.session_key or "default",
+            )
+            return None
+
+        context.response = response
+        context.usage = dict(raw_usage)
+        clean = hook.finalize_content(context, response.content)
+        return None if is_blank_text(clean) else clean
 
     @staticmethod
     def _budget_exhausted_finalization_messages(

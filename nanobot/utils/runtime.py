@@ -32,6 +32,24 @@ BUDGET_EXHAUSTED_FINALIZATION_PROMPT = (
     "done, what remains, and the best next step if anything is incomplete."
 )
 
+CONTEXT_OVERFLOW_REPROMPT = (
+    "The previous agent turn cannot continue because the prepared request would exceed "
+    "your configured context window. You cannot complete the user's current request in "
+    "this turn. Do not attempt the original task, infer missing results, or call tools. "
+    "Provide a concise final response that clearly explains the context limitation and "
+    "suggests reducing the request or tool output, lowering the requested response size, "
+    "or using a model with a larger context window. Do not claim the task was completed.\n\n"
+    "Internal budget details: estimated prompt {prompt_tokens} tokens; hard input budget "
+    "{input_budget} tokens; configured context window {context_window_tokens} tokens; "
+    "requested response limit {max_tokens} tokens."
+)
+
+CONTEXT_OVERFLOW_FALLBACK_MESSAGE = (
+    "I can't complete this request because it exceeds the model's available context window. "
+    "Please reduce the request or tool output, lower the requested response size, or use a "
+    "model with a larger context window."
+)
+
 LENGTH_RECOVERY_PROMPT = (
     "Output limit reached. Continue exactly where you left off "
     "— no recap, no apology. Break remaining work into smaller steps if needed."
@@ -77,6 +95,25 @@ def build_finalization_retry_message() -> dict[str, str]:
 def build_budget_exhausted_finalization_message() -> dict[str, str]:
     """Prompt the model for a no-tools final response after budget exhaustion."""
     return {"role": "user", "content": BUDGET_EXHAUSTED_FINALIZATION_PROMPT}
+
+
+def build_context_overflow_reprompt(
+    *,
+    prompt_tokens: int,
+    input_budget: int,
+    context_window_tokens: int,
+    max_tokens: int,
+) -> dict[str, str]:
+    """Build a small no-tools prompt for a context-overflow final response."""
+    return {
+        "role": "user",
+        "content": CONTEXT_OVERFLOW_REPROMPT.format(
+            prompt_tokens=prompt_tokens,
+            input_budget=input_budget,
+            context_window_tokens=context_window_tokens,
+            max_tokens=max_tokens,
+        ),
+    }
 
 
 def build_length_recovery_message() -> dict[str, str]:

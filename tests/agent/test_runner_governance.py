@@ -17,6 +17,7 @@ from nanobot.agent.context_governance import (
 from nanobot.agent.runner import AgentRunSpec
 from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import LLMResponse, ToolCallRequest
+from nanobot.utils.runtime import CONTEXT_OVERFLOW_FALLBACK_MESSAGE
 
 _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
 
@@ -878,6 +879,146 @@ def test_snip_history_no_user_at_all_falls_back_gracefully(monkeypatch):
         assert non_system[0]["role"] in ("user", "tool"), (
             f"Safety net should ensure first non-system is user/tool, got {non_system[0]['role']}"
         )
+
+
+@pytest.mark.asyncio
+async def test_runner_reprompts_without_oversized_context(monkeypatch):
+    """Oversized current-turn tool results are replaced by a small no-tools re-prompt."""
+    from nanobot.agent.runner import AgentRunner
+
+    calls: list[dict] = []
+    provider = MagicMock()
+
+    async def chat_with_retry(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return LLMResponse(
+                content="working",
+                tool_calls=[
+                    ToolCallRequest(
+                        id="search_1",
+                        name="web_search",
+                        arguments={"query": "example"},
+                    )
+                ],
+                finish_reason="tool_calls",
+                usage={"prompt_tokens": 100, "completion_tokens": 10},
+            )
+        return LLMResponse(
+            content="I cannot complete this request within the available context window.",
+            finish_reason="stop",
+            usage={"prompt_tokens": 100, "completion_tokens": 12},
+        )
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = [
+        {"type": "function", "function": {"name": "web_search"}}
+    ]
+    tools.execute = AsyncMock(return_value="oversized tool result payload")
+
+    def estimate(_provider, _model, estimate_messages, estimate_tools):
+        if estimate_tools is None:
+            return 100, "test"
+        if any(message.get("role") == "tool" for message in estimate_messages):
+            return 900, "test"
+        return 100, "test"
+
+    monkeypatch.setattr("nanobot.agent.runner.estimate_prompt_tokens_chain", estimate)
+
+    result = await AgentRunner().run(make_run_spec(
+        provider,
+        initial_messages=[{"role": "user", "content": "oversized original request"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=2,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        context_window_tokens=1000,
+        max_tokens=900,
+    ))
+
+    assert len(calls) == 2
+    assert calls[1]["tools"] is None
+    assert calls[1]["max_tokens"] == 256
+    assert len(calls[1]["messages"]) == 1
+    retry_prompt = calls[1]["messages"][0]["content"]
+    assert retry_prompt.isascii()
+    assert "cannot continue" in retry_prompt
+    assert "oversized original request" not in retry_prompt
+    assert "oversized tool result payload" not in retry_prompt
+    assert result.stop_reason == "context_overflow"
+    assert result.tools_used == ["web_search"]
+    assert result.final_content == (
+        "I cannot complete this request within the available context window."
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_sends_request_within_hard_budget_despite_soft_headroom(monkeypatch):
+    """The final gate blocks only certain provider overflow, not the soft safety target."""
+    from nanobot.agent.runner import AgentRunner
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content="done",
+        finish_reason="stop",
+        usage={"prompt_tokens": 1000, "completion_tokens": 10},
+    ))
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    monkeypatch.setattr(
+        "nanobot.agent.runner.estimate_prompt_tokens_chain",
+        lambda *_args, **_kwargs: (1000, "test"),
+    )
+
+    result = await AgentRunner().run(make_run_spec(
+        provider,
+        initial_messages=[{"role": "user", "content": "hello"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        context_window_tokens=2000,
+        max_tokens=800,
+    ))
+
+    provider.chat_with_retry.assert_awaited_once()
+    request = provider.chat_with_retry.await_args.kwargs
+    assert request["tools"] == []
+    assert request["max_tokens"] == 800
+    assert result.stop_reason == "completed"
+    assert result.final_content == "done"
+
+
+@pytest.mark.asyncio
+async def test_runner_uses_fallback_when_context_overflow_reprompt_cannot_fit(monkeypatch):
+    """Do not send even the small re-prompt when the configured window cannot hold it."""
+    from nanobot.agent.runner import AgentRunner
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock()
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    def estimate(_provider, _model, _messages, estimate_tools):
+        return (60, "test") if estimate_tools is None else (100, "test")
+
+    monkeypatch.setattr("nanobot.agent.runner.estimate_prompt_tokens_chain", estimate)
+
+    result = await AgentRunner().run(make_run_spec(
+        provider,
+        initial_messages=[{"role": "user", "content": "hello"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        context_window_tokens=80,
+        max_tokens=80,
+    ))
+
+    provider.chat_with_retry.assert_not_awaited()
+    assert result.stop_reason == "context_overflow"
+    assert result.final_content == CONTEXT_OVERFLOW_FALLBACK_MESSAGE
 
 
 # ---------------------------------------------------------------------------
